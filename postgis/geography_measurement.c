@@ -65,6 +65,11 @@ Datum geography_perimeter(PG_FUNCTION_ARGS);
 Datum geography_project(PG_FUNCTION_ARGS);
 Datum geography_azimuth(PG_FUNCTION_ARGS);
 Datum geography_segmentize(PG_FUNCTION_ARGS);
+Datum geography_line_interpolate_point(PG_FUNCTION_ARGS);
+Datum geography_line_locate_point(PG_FUNCTION_ARGS);
+Datum geography_closestpoint(PG_FUNCTION_ARGS);
+Datum geography_shortestline(PG_FUNCTION_ARGS);
+Datum geography_segmentize1(PG_FUNCTION_ARGS);
 
 
 PG_FUNCTION_INFO_V1(geography_distance_knn);
@@ -1136,3 +1141,697 @@ Datum geography_segmentize(PG_FUNCTION_ARGS)
 }
 
 
+/* Interpolate a point along a geographic line. */
+void
+interpolate_point4d_sphere(
+        const POINT3D *p1, const POINT3D *p2,
+        const POINT4D *v1, const POINT4D *v2,
+        double f,
+        POINT4D *p)
+{
+    /* Calculate interpolated point */
+    POINT3D mid;
+    mid.x = p1->x + ((p2->x - p1->x) * f);
+    mid.y = p1->y + ((p2->y - p1->y) * f);
+    mid.z = p1->z + ((p2->z - p1->z) * f);
+    normalize(&mid);
+
+    /* Calculate z/m values */
+    GEOGRAPHIC_POINT g;
+    cart2geog(&mid, &g);
+    p->x = rad2deg(g.lon);
+    p->y = rad2deg(g.lat);
+    p->z = v1->z + ((v2->z - v1->z) * f);
+    p->m = v1->m + ((v2->m - v1->m) * f);
+}
+
+double ptarray_length_sphere(const POINTARRAY *pa)
+{
+    GEOGRAPHIC_POINT a, b;
+    POINT4D p;
+    uint32_t i;
+    double length = 0.0;
+
+    /* Return zero on non-sensical inputs */
+    if ( ! pa || pa->npoints < 2 )
+        return 0.0;
+
+    /* Initialize first point */
+    getPoint4d_p(pa, 0, &p);
+    geographic_point_init(p.x, p.y, &a);
+
+    /* Loop and sum the length for each segment */
+    for ( i = 1; i < pa->npoints; i++ )
+    {
+        getPoint4d_p(pa, i, &p);
+        geographic_point_init(p.x, p.y, &b);
+        /* Add this segment length to the total */
+        length +=  sphere_distance(&a, &b);
+    }
+    return length;
+}
+
+POINTARRAY* lwline_interpolate_points_sphere(const LWLINE *line, double length_fraction,
+                                             char repeat)
+{
+    POINT4D pt;
+    uint32_t i;
+    uint32_t points_to_interpolate;
+    uint32_t points_found = 0;
+    double length;
+    double length_fraction_increment = length_fraction;
+    double length_fraction_consumed = 0;
+    char has_z = (char) lwgeom_has_z(lwline_as_lwgeom(line));
+    char has_m = (char) lwgeom_has_m(lwline_as_lwgeom(line));
+    const POINTARRAY* ipa = line->points;
+    POINTARRAY* opa;
+    POINT4D p1, p2;
+    POINT3D q1, q2;
+    GEOGRAPHIC_POINT g1, g2;
+
+    /* Empty.InterpolatePoint == Point Empty */
+    if ( lwline_is_empty(line) )
+    {
+        return ptarray_construct_empty(has_z, has_m, 0);
+    }
+
+    /* If distance is one of the two extremes, return the point on that
+     * end rather than doing any computations
+     */
+    if ( length_fraction == 0.0 || length_fraction == 1.0 )
+    {
+        if ( length_fraction == 0.0 )
+            getPoint4d_p(ipa, 0, &pt);
+        else
+            getPoint4d_p(ipa, ipa->npoints-1, &pt);
+
+        opa = ptarray_construct(has_z, has_m, 1);
+        ptarray_set_point4d(opa, 0, &pt);
+
+        return opa;
+    }
+
+    /* Interpolate points along the line */
+    length = ptarray_length_sphere(ipa);
+    points_to_interpolate = repeat ? (uint32_t) floor(1 / length_fraction) : 1;
+    opa = ptarray_construct(has_z, has_m, points_to_interpolate);
+
+    getPoint4d_p(ipa, 0, &p1);
+    geographic_point_init(p1.x, p1.y, &g1);
+    for ( i = 0; i < ipa->npoints - 1 && points_found < points_to_interpolate; i++ )
+    {
+        getPoint4d_p(ipa, i+1, &p2);
+        geographic_point_init(p2.x, p2.y, &g2);
+        double segment_length_frac = sphere_distance(&g1, &g2) / length;
+
+        /* If our target distance is before the total length we've seen
+         * so far. create a new point some distance down the current
+         * segment.
+         */
+        while ( length_fraction < length_fraction_consumed + segment_length_frac && points_found < points_to_interpolate )
+        {
+            double segment_fraction = (length_fraction - length_fraction_consumed) / segment_length_frac;
+            geog2cart(&g1, &q1);
+            geog2cart(&g2, &q2);
+            interpolate_point4d_sphere(&q1, &q2, &p1, &p2, segment_fraction, &pt);
+            ptarray_set_point4d(opa, points_found++, &pt);
+            length_fraction += length_fraction_increment;
+        }
+
+        length_fraction_consumed += segment_length_frac;
+
+        p1 = p2;
+        g1 = g2;
+    }
+
+    /* Return the last point on the line. This shouldn't happen, but
+     * could if there's some floating point rounding errors. */
+    if (points_found < points_to_interpolate) {
+        getPoint4d_p(ipa, ipa->npoints - 1, &pt);
+        ptarray_set_point4d(opa, points_found, &pt);
+    }
+
+    return opa;
+}
+
+/*
+** geography_line_interpolate_point(GSERIALIZED *g1, double distance_fraction, bool repeat)
+** returns a point interpolated along a geographic line
+*/
+PG_FUNCTION_INFO_V1(geography_line_interpolate_point);
+Datum geography_line_interpolate_point(PG_FUNCTION_ARGS)
+{
+    GSERIALIZED *g1 = PG_GETARG_GSERIALIZED_P(0);
+    double distance_fraction = PG_GETARG_FLOAT8(1);
+    bool repeat = PG_NARGS() > 2 && PG_GETARG_BOOL(2);
+    int srid = gserialized_get_srid(g1);
+    LWLINE* lwline;
+    LWGEOM* lwresult;
+    POINTARRAY* opa;
+    GSERIALIZED *result;
+
+    if ( distance_fraction < 0 || distance_fraction > 1 )
+    {
+        elog(ERROR,"line_interpolate_point: 2nd arg isn't within [0,1]");
+        PG_FREE_IF_COPY(g1, 0);
+        PG_RETURN_NULL();
+    }
+
+    if ( gserialized_get_type(g1) != LINETYPE )
+    {
+        elog(ERROR,"line_interpolate_point: 1st arg isn't a line");
+        PG_FREE_IF_COPY(g1, 0);
+        PG_RETURN_NULL();
+    }
+
+    lwline = lwgeom_as_lwline(lwgeom_from_gserialized(g1));
+    opa = lwline_interpolate_points_sphere(lwline, distance_fraction, repeat);
+
+    lwgeom_free(lwline_as_lwgeom(lwline));
+    PG_FREE_IF_COPY(g1, 0);
+
+    if (opa->npoints <= 1)
+    {
+        lwresult = lwpoint_as_lwgeom(lwpoint_construct(srid, NULL, opa));
+    } else {
+        lwresult = lwmpoint_as_lwgeom(lwmpoint_construct(srid, opa));
+    }
+
+    lwgeom_set_geodetic(lwresult, true);
+    result = geography_serialize(lwresult);
+    lwgeom_free(lwresult);
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/* Locate a point along a geographic line. */
+double
+ptarray_locate_point_sphere(const POINTARRAY *pa, const POINT4D *p,
+                            double tolerance, double *mindistout, POINT4D *closest)
+{
+    GEOGRAPHIC_EDGE e;
+    GEOGRAPHIC_POINT a, b, nearest;
+    POINT4D p1, p2;
+    POINT2D p2d;
+    uint32_t i, seg = 0;
+    double distance, result;
+    long double fraction, /* Used for computing Z and M values of the closest point */
+            length, /* Length of the current segment */
+            seglength, /* length of the segment where the closest point is located */
+            partlength = 0.0, /* length from the beginning of the point array to the closest point */
+            totlength = 0.0;  /* length of the point array */
+
+    /* Initialize target point */
+    geographic_point_init(p->x, p->y, &a);
+
+    /* Handle point/point case here */
+    if ( pa->npoints <= 1)
+    {
+        if ( pa->npoints == 1 && mindistout )
+        {
+            getPoint4d_p(pa, 0, &p1);
+            geographic_point_init(p1.x, p1.y, &b);
+            *mindistout = sphere_distance(&a, &b);
+        }
+        return 0.0;
+    }
+
+    /* Make distance really big, so that everything will be smaller than it */
+    distance = FLT_MAX;
+
+    /* Initialize first point of array */
+    getPoint4d_p(pa, 0, &p1);
+    geographic_point_init(p1.x, p1.y, &(e.start));
+
+    /* Iterate through the edges in the line */
+    for ( i = 1; i < pa->npoints; i++ )
+    {
+        double d;
+        getPoint4d_p(pa, i, &p2);
+        geographic_point_init(p2.x, p2.y, &(e.end));
+        /* Get the spherical distance between point and edge */
+        d = edge_distance_to_point(&e, &a, &b);
+        /* New shortest distance! Record this distance/location/segment */
+        if ( d < distance )
+        {
+            distance = d;
+            nearest = b;
+            seg = i - 1;
+        }
+        /* We've gotten closer than the tolerance... */
+        if ( d < tolerance )
+            break;
+
+        e.start = e.end;
+    }
+
+    /* Initialize first point of array */
+    getPoint4d_p(pa, 0, &p1);
+    geographic_point_init(p1.x, p1.y, &a);
+
+    /* Loop and sum the length for each segment */
+    for ( i = 1; i < pa->npoints; i++ )
+    {
+        getPoint4d_p(pa, i, &p2);
+        geographic_point_init(p2.x, p2.y, &b);
+
+        /* Compute length of current segment */
+        length = sphere_distance(&a, &b);
+
+        /* Add segment length to the partial and total length */
+        if (i < seg)
+            partlength += length;
+        else if (i == seg)
+            seglength = length;
+        totlength += length;
+
+        /* B gets incremented in the next loop, so we save the value here */
+        a = b;
+    }
+
+    /* Get the points defining the segment of the closest point */
+    getPoint4d_p(pa, seg, &p1);
+    getPoint4d_p(pa, seg + 1, &p2);
+
+    /* Compute distance from beginning of the segment to closest point */
+    geographic_point_init(p1.x, p1.y, &a);
+    length = sphere_distance(&a, &nearest);
+
+    /* Add this length to the partial length */
+    partlength += length;
+
+    /* Set output parameters */
+    if ( mindistout )
+        *mindistout = distance;
+    if ( closest )
+    {
+        /* Set lon and lat for output parameter */
+        closest->x = p2d.x = rad2deg(nearest.lon);
+        closest->y = p2d.y = rad2deg(nearest.lat);
+
+        /* For robustness, return the original point in line when
+         * closest point ~= one of the points in line */
+        if (p2d_same(&p2d, getPoint2d_cp(pa, seg)))
+            getPoint4d_p(pa, seg, closest);
+        else if (p2d_same(&p2d, getPoint2d_cp(pa, seg + 1)))
+            getPoint4d_p(pa, seg + 1, closest);
+        else
+        {
+            if (ptarray_has_z(pa) || ptarray_has_m(pa))
+            {
+                fraction = length / seglength;
+                closest->z = p1.z + (double) ((long double) (p2.z - p1.z) * fraction);
+                closest->m = p1.m + (double) ((long double) (p2.m - p1.m) * fraction);
+            }
+            else
+            {
+                closest->z = NO_Z_VALUE;
+                closest->m = NO_M_VALUE;
+            }
+        }
+    }
+
+    /* Location of any point on a zero-length line is 0 */
+    /* See http://trac.osgeo.org/postgis/ticket/1772#comment:2 */
+    if ( totlength == 0 )
+        return 0.0;
+
+    /* For robustness, force 0/1 when closest point == start/endpoint */
+    getPoint4d_p(pa, 0, &p1);
+    getPoint4d_p(pa, pa->npoints - 1, &p2);
+    if ( seg == 0 && p4d_same(closest, &p1) )
+        return 0.0;
+    if ( seg >= (pa->npoints - 2) && p4d_same(closest, &p2) )
+        return 1.0;
+
+    result = (double) (partlength / totlength);
+    return result;
+}
+
+/*
+** geography_line_locate_point(GSERIALIZED *g1, GSERIALIZED *g2)
+** returns a float between 0 and 1 representing the location of the closest point on LineString to the given Point
+*/
+PG_FUNCTION_INFO_V1(geography_line_locate_point);
+Datum geography_line_locate_point(PG_FUNCTION_ARGS)
+{
+    GSERIALIZED *g1 = PG_GETARG_GSERIALIZED_P(0);
+    GSERIALIZED *g2 = PG_GETARG_GSERIALIZED_P(1);
+    LWLINE *lwline;
+    LWPOINT *lwpoint;
+    POINT4D p, proj;
+    double ret;
+
+    if ( gserialized_get_type(g1) != LINETYPE )
+    {
+        elog(ERROR,"line_locate_point: 1st arg isn't a line");
+        PG_RETURN_NULL();
+    }
+    if ( gserialized_get_type(g2) != POINTTYPE )
+    {
+        elog(ERROR,"line_locate_point: 2st arg isn't a point");
+        PG_RETURN_NULL();
+    }
+
+    gserialized_error_if_srid_mismatch(g1, g2, __func__);
+
+    lwline = lwgeom_as_lwline(lwgeom_from_gserialized(g1));
+    lwpoint = lwgeom_as_lwpoint(lwgeom_from_gserialized(g2));
+
+    lwpoint_getPoint4d_p(lwpoint, &p);
+
+    ret = ptarray_locate_point_sphere(lwline->points, &p, FP_TOLERANCE, NULL, &proj);
+
+    PG_RETURN_FLOAT8(ret);
+}
+
+
+
+/*
+** geography_closestpoint(GSERIALIZED *g1, GSERIALIZED *g2)
+** returns the point in first input geography that is closest to the second input geography in 2d
+*/
+PG_FUNCTION_INFO_V1(geography_closestpoint);
+Datum geography_closestpoint(PG_FUNCTION_ARGS)
+{
+    GSERIALIZED* g1 = NULL;
+    GSERIALIZED* g2 = NULL;
+    LWGEOM *point;
+    GSERIALIZED* result;
+
+    /* Get our geography objects loaded into memory. */
+    g1 = PG_GETARG_GSERIALIZED_P(0);
+    g2 = PG_GETARG_GSERIALIZED_P(1);
+
+    gserialized_error_if_srid_mismatch(g1, g2, __func__);
+
+    /* Return NULL on empty arguments. */
+    if ( gserialized_is_empty(g1) || gserialized_is_empty(g2) )
+    {
+        PG_FREE_IF_COPY(g1, 0);
+        PG_FREE_IF_COPY(g2, 1);
+        PG_RETURN_NULL();
+    }
+
+    point = geography_tree_closestpoint(g1, g2, FP_TOLERANCE);
+
+    if (lwgeom_is_empty(point))
+        PG_RETURN_NULL();
+
+    result = geography_serialize(point);
+    lwgeom_free(point);
+
+    PG_FREE_IF_COPY(g1, 0);
+    PG_FREE_IF_COPY(g2, 1);
+    PG_RETURN_POINTER(result);
+}
+
+
+
+/*
+** geography_shortestline(GSERIALIZED *g1, GSERIALIZED *g2)
+** returns the 2-dimensional shortest line between two geographies
+*/
+PG_FUNCTION_INFO_V1(geography_shortestline);
+Datum geography_shortestline(PG_FUNCTION_ARGS)
+{
+    GSERIALIZED* g1 = NULL;
+    GSERIALIZED* g2 = NULL;
+    LWGEOM *line;
+    GSERIALIZED* result;
+
+    /* Get our geography objects loaded into memory. */
+    g1 = PG_GETARG_GSERIALIZED_P(0);
+    g2 = PG_GETARG_GSERIALIZED_P(1);
+
+    gserialized_error_if_srid_mismatch(g1, g2, __func__);
+
+    /* Return NULL on empty arguments. */
+    if ( gserialized_is_empty(g1) || gserialized_is_empty(g2) )
+    {
+        PG_FREE_IF_COPY(g1, 0);
+        PG_FREE_IF_COPY(g2, 1);
+        PG_RETURN_NULL();
+    }
+
+    line = geography_tree_shortestline(g1, g2, FP_TOLERANCE);
+
+    if (lwgeom_is_empty(line))
+        PG_RETURN_NULL();
+
+    result = geography_serialize(line);
+    lwgeom_free(line);
+
+    PG_FREE_IF_COPY(g1, 0);
+    PG_FREE_IF_COPY(g2, 1);
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+** New version of ST_Segmentize that allows to perform the calculation on a sphere or spheroid
+** @param p1, p2 - 3-space points we are interpolating between
+** @param v1, v2 - real values and z/m values
+** @param d, max_seg_length - current segment length and segment limit
+*/
+static int ptarray_segmentize_spheroid_edge_recursive (
+        const POINT3D *p1, const POINT3D *p2,
+        const POINT4D *v1, const POINT4D *v2,
+        double d, double max_seg_length,
+        POINTARRAY *pa)
+{
+    GEOGRAPHIC_POINT g;
+    /* Reached the terminal leaf in recursion. Add */
+    /* the left-most point to the pointarray here */
+    /* We recurse down the left side first, so outputs should */
+    /* end up added to the array in order this way */
+    if (d <= max_seg_length)
+    {
+        POINT4D p;
+        cart2geog(p1, &g);
+        p.x = v1->x;
+        p.y = v1->y;
+        p.z = v1->z;
+        p.m = v1->m;
+        return ptarray_append_point(pa, &p, LW_FALSE);
+    }
+        /* Find the mid-point and recurse on the left and then the right */
+    else
+    {
+        /* Calculate mid-point */
+        POINT3D mid;
+        mid.x = (p1->x + p2->x) / 2.0;
+        mid.y = (p1->y + p2->y) / 2.0;
+        mid.z = (p1->z + p2->z) / 2.0;
+        normalize(&mid);
+
+        /* Calculate z/m mid-values */
+        POINT4D midv;
+        cart2geog(&mid, &g);
+        midv.x = rad2deg(g.lon);
+        midv.y = rad2deg(g.lat);
+        midv.z = (v1->z + v2->z) / 2.0;
+        midv.m = (v1->m + v2->m) / 2.0;
+        /* Recurse on the left first */
+        ptarray_segmentize_spheroid_edge_recursive(p1, &mid, v1, &midv, d/2.0, max_seg_length, pa);
+        ptarray_segmentize_spheroid_edge_recursive(&mid, p2, &midv, v2, d/2.0, max_seg_length, pa);
+        return LW_SUCCESS;
+    }
+}
+
+/*
+** Create a new point array with no segment longer than the input segment length (expressed in radians!)
+** @param pa_in - input point array pointer
+** @param max_seg_length - maximum output segment length in radians
+*/
+static POINTARRAY*
+ptarray_segmentize_spheroid(const POINTARRAY *pa_in, double max_seg_length, const SPHEROID *s)
+{
+    POINTARRAY *pa_out;
+    int hasz = ptarray_has_z(pa_in);
+    int hasm = ptarray_has_m(pa_in);
+    POINT4D p1, p2;
+    POINT3D q1, q2;
+    GEOGRAPHIC_POINT g1, g2;
+    uint32_t i;
+
+    /* Just crap out on crazy input */
+    if ( ! pa_in )
+        lwerror("%s: null input pointarray", __func__);
+    if ( max_seg_length <= 0.0 )
+        lwerror("%s: maximum segment length must be positive", __func__);
+
+    /* Empty starting array */
+    pa_out = ptarray_construct_empty(hasz, hasm, pa_in->npoints);
+
+    /* Simple loop per edge */
+    for (i = 1; i < pa_in->npoints; i++)
+    {
+        getPoint4d_p(pa_in, i-1, &p1);
+        getPoint4d_p(pa_in, i, &p2);
+        geographic_point_init(p1.x, p1.y, &g1);
+        geographic_point_init(p2.x, p2.y, &g2);
+
+        /* Skip duplicate points (except in case of 2-point lines!) */
+        if ((pa_in->npoints > 2) && p4d_same(&p1, &p2))
+            continue;
+
+        /* How long is this edge? */
+        double d;
+        /* Special sphere case */
+        if ( s->a == s->b )
+            d = s->radius * sphere_distance(&g1, &g2);
+            /* Spheroid case */
+        else
+            d = spheroid_distance(&g1, &g2, s);
+
+        if (d > max_seg_length)
+        {
+            geog2cart(&g1, &q1);
+            geog2cart(&g2, &q2);
+            /* 3-d end points, XYZM end point, current edge size, min edge size */
+            ptarray_segmentize_spheroid_edge_recursive(&q1, &q2, &p1, &p2, d, max_seg_length, pa_out);
+        }
+            /* If we don't segmentize, we need to add first point manually */
+        else
+        {
+            ptarray_append_point(pa_out, &p1, LW_TRUE);
+        }
+    }
+    /* Always add the last point */
+    ptarray_append_point(pa_out, &p2, LW_TRUE);
+    return pa_out;
+}
+
+/*
+** Create a new, densified geometry where no segment is longer than max_seg_length.
+** Input geometry is not altered, output geometry must be freed by caller.
+** @param lwg_in = input geometry
+** @param max_seg_length = maximum segment length in radians
+*/
+LWGEOM*
+lwgeom_segmentize_spheroid(const LWGEOM *lwg_in, double max_seg_length, const SPHEROID *s)
+{
+    POINTARRAY *pa_out;
+    LWLINE *lwline;
+    LWPOLY *lwpoly_in, *lwpoly_out;
+    LWCOLLECTION *lwcol_in, *lwcol_out;
+    uint32_t i;
+
+    /* Reflect NULL */
+    if ( ! lwg_in )
+        return NULL;
+
+    /* Clone empty */
+    if ( lwgeom_is_empty(lwg_in) )
+        return lwgeom_clone(lwg_in);
+
+    switch (lwg_in->type)
+    {
+        case MULTIPOINTTYPE:
+        case POINTTYPE:
+            return lwgeom_clone_deep(lwg_in);
+            break;
+        case LINETYPE:
+            lwline = lwgeom_as_lwline(lwg_in);
+            pa_out = ptarray_segmentize_spheroid(lwline->points, max_seg_length, s);
+            return lwline_as_lwgeom(lwline_construct(lwg_in->srid, NULL, pa_out));
+            break;
+        case POLYGONTYPE:
+            lwpoly_in = lwgeom_as_lwpoly(lwg_in);
+            lwpoly_out = lwpoly_construct_empty(lwg_in->srid, lwgeom_has_z(lwg_in), lwgeom_has_m(lwg_in));
+            for ( i = 0; i < lwpoly_in->nrings; i++ )
+            {
+                pa_out = ptarray_segmentize_spheroid(lwpoly_in->rings[i], max_seg_length, s);
+                lwpoly_add_ring(lwpoly_out, pa_out);
+            }
+            return lwpoly_as_lwgeom(lwpoly_out);
+            break;
+        case MULTILINETYPE:
+        case MULTIPOLYGONTYPE:
+        case COLLECTIONTYPE:
+            lwcol_in = lwgeom_as_lwcollection(lwg_in);
+            lwcol_out = lwcollection_construct_empty(lwg_in->type, lwg_in->srid, lwgeom_has_z(lwg_in), lwgeom_has_m(lwg_in));
+            for ( i = 0; i < lwcol_in->ngeoms; i++ )
+            {
+                lwcollection_add_lwgeom(lwcol_out, lwgeom_segmentize_spheroid(lwcol_in->geoms[i], max_seg_length, s));
+            }
+            return lwcollection_as_lwgeom(lwcol_out);
+            break;
+        default:
+            lwerror("lwgeom_segmentize_spheroid: unsupported input geometry type: %d - %s",
+                    lwg_in->type, lwtype_name(lwg_in->type));
+            break;
+    }
+
+    lwerror("lwgeom_segmentize_spheroid got to the end of the function, should not happen");
+    return NULL;
+}
+
+/*
+** geography_segmentize1(GSERIALIZED *g1, double max_seg_length, boolean use_spheroid)
+** returns densified geometry with no segment longer than max
+*/
+PG_FUNCTION_INFO_V1(geography_segmentize1);
+Datum geography_segmentize1(PG_FUNCTION_ARGS)
+{
+    LWGEOM *lwgeom1 = NULL;
+    LWGEOM *lwgeom2 = NULL;
+    GSERIALIZED *g1 = NULL;
+    GSERIALIZED *g2 = NULL;
+    double max_seg_length;
+    bool use_spheroid = true;
+    uint32_t type1;
+    SPHEROID s;
+
+    /* Get our geometry object loaded into memory. */
+    g1 = PG_GETARG_GSERIALIZED_P(0);
+    type1 = gserialized_get_type(g1);
+
+    /* Get max_seg_length in metric units */
+    max_seg_length = PG_GETARG_FLOAT8(1);
+
+    /* Read calculation type */
+    if ( PG_NARGS() > 2 && ! PG_ARGISNULL(2) )
+        use_spheroid = PG_GETARG_BOOL(2);
+
+    /* We can't densify points or points, reflect them back */
+    if ( type1 == POINTTYPE || type1 == MULTIPOINTTYPE || gserialized_is_empty(g1) )
+        PG_RETURN_POINTER(g1);
+
+    /* Initialize spheroid */
+    /* We currently cannot use the following statement since PROJ4 API is not
+     * available directly to MobilityDB. */
+    // spheroid_init_from_srid(fcinfo, srid, &s);
+    spheroid_init(&s, WGS84_MAJOR_AXIS, WGS84_MINOR_AXIS);
+
+    /* Set to sphere if requested */
+    if ( ! use_spheroid )
+        s.a = s.b = s.radius;
+
+    /* Deserialize */
+    lwgeom1 = lwgeom_from_gserialized(g1);
+
+    /* Calculate the densified geometry */
+    lwgeom2 = lwgeom_segmentize_spheroid(lwgeom1, max_seg_length, &s);
+
+    /*
+    ** Set the geodetic flag so subsequent
+    ** functions do the right thing.
+    */
+    lwgeom_set_geodetic(lwgeom2, true);
+
+    /* Recalculate the boxes after re-setting the geodetic bit */
+    lwgeom_drop_bbox(lwgeom2);
+
+    /* We are trusting geography_serialize will add a box if needed */
+    g2 = geography_serialize(lwgeom2);
+
+    /* Clean up */
+    lwgeom_free(lwgeom1);
+    lwgeom_free(lwgeom2);
+    PG_FREE_IF_COPY(g1, 0);
+
+    PG_RETURN_POINTER(g2);
+}
